@@ -31,6 +31,7 @@ import { selectMemoryGate } from './memoryGate';
 import { getEnvironmentKey } from '../core/environmentGroups';
 import { formatTestEnvironmentPrebundleFallbackWarning } from '../core/envDependencies';
 import { projectRuntimeConfig } from '../core/runtimeConfigProjection';
+import { composeWorkerEnv } from '../core/workerEnv';
 import { prepareAssetFilesForIPC } from '../utils/assetFiles';
 import {
   type BundleCoverageResult,
@@ -47,8 +48,15 @@ import type { PoolTask, PoolWorkerKind } from './types';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const getRuntimeConfig = (context: ProjectContext): RuntimeConfig =>
-  projectRuntimeConfig(context, { envMode: 'inherit' });
+const getWorkerConfig = (context: RstestContext, project: ProjectContext) => ({
+  runtimeConfig: projectRuntimeConfig(project, {
+    envMode: 'inherit',
+    env: composeWorkerEnv(context.workerEnv),
+  }),
+  deletedEnvKeys: Object.keys(context.workerEnv).filter(
+    (key) => context.workerEnv[key] === undefined,
+  ),
+});
 
 const filterAssetsByEntry = async (
   entryInfo: EntryInfo,
@@ -110,6 +118,7 @@ const buildTask = async ({
   context,
   project,
   runtimeConfig,
+  deletedEnvKeys,
   setupEntries,
   setupAssets,
   assetNames,
@@ -129,6 +138,7 @@ const buildTask = async ({
   context: RstestContext;
   project: ProjectContext;
   runtimeConfig: RuntimeConfig;
+  deletedEnvKeys: string[];
   setupEntries: EntryInfo[];
   setupAssets: string[];
   assetNames: string[];
@@ -199,6 +209,7 @@ const buildTask = async ({
           testEnvironmentModule,
           trace: context.trace,
         },
+        deletedEnvKeys,
         type,
         setupEntries,
         updateSnapshot,
@@ -398,11 +409,11 @@ export const createPool = async ({
       ...execArgv,
       ...(isDeno ? [] : getNodeExecArgv()),
     ],
-    env: {
+    getEnv: () => ({
       NODE_ENV: 'test',
       ...getForceColorEnv(),
-      ...process.env,
-    } as Record<string, string>,
+      ...composeWorkerEnv(context.workerEnv),
+    }),
     memoryGate: selectMemoryGate(workerKind),
     onTestEnvironmentFallback: ({ packageName, reason }) => {
       logger.warn(
@@ -431,7 +442,10 @@ export const createPool = async ({
       traceSpan,
     }) => {
       const projectName = project.name;
-      const runtimeConfig = getRuntimeConfig(project);
+      const { runtimeConfig, deletedEnvKeys } = getWorkerConfig(
+        context,
+        project,
+      );
       const sink = createProjectSink(project);
       const rpcMethods = sinkToRuntimeRpc(sink);
       const setupAssets = setupEntries.flatMap((entry) => entry.files || []);
@@ -469,6 +483,7 @@ export const createPool = async ({
                   context,
                   project,
                   runtimeConfig,
+                  deletedEnvKeys,
                   setupEntries,
                   setupAssets,
                   assetNames,
@@ -576,7 +591,10 @@ export const createPool = async ({
       project,
       updateSnapshot,
     }) => {
-      const runtimeConfig = getRuntimeConfig(project);
+      const { runtimeConfig, deletedEnvKeys } = getWorkerConfig(
+        context,
+        project,
+      );
       const projectName = project.normalizedConfig.name;
       const rpcMethods = sinkToRuntimeRpc(createProjectSink(project));
       const setupAssets = setupEntries.flatMap((entry) => entry.files || []);
@@ -591,6 +609,7 @@ export const createPool = async ({
             context,
             project,
             runtimeConfig,
+            deletedEnvKeys,
             setupEntries,
             setupAssets,
             assetNames,

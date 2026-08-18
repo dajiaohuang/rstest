@@ -268,7 +268,7 @@ const collectProjectEntries = async (
           includeSource,
           rootPath: context.rootPath,
           projectRoot: root,
-          fileFilters: [],
+          fileFilters: undefined,
         }),
       );
     }),

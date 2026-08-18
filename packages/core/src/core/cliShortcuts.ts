@@ -1,7 +1,8 @@
 import type { RstestContext } from '../types';
 import { clearScreen, color, isTTY, logger } from '../utils';
 
-export const isCliShortcutsEnabled = (): boolean => isTTY('stdin');
+export const isCliShortcutsEnabled = (context: RstestContext): boolean =>
+  !context.embedded && isTTY('stdin');
 
 /**
  * Watch-ready banner printed after the initial run and every rerun. Shared by
@@ -253,7 +254,7 @@ export async function setupCliShortcuts({
         try {
           await closeServer();
         } finally {
-          process.exit(process.exitCode ?? 0);
+          process.exit();
         }
       },
     },

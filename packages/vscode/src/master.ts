@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import net from 'node:net';
 import path, { dirname } from 'node:path';
 import { type BirpcReturn, createBirpc } from 'birpc';
@@ -18,12 +18,64 @@ import { runInTerminal as sendToTerminal, shellQuote } from './terminal';
 import { TestRunReporter } from './testRunReporter';
 import { toErrorMessage } from './utils';
 import {
-  formatCoreVersionWarningMessage,
-  shouldWarnCoreVersion,
+  formatConfiguredCoreVersionWarningMessage,
+  formatUnsupportedCoreVersionMessage,
+  isUnsupportedCoreVersion,
 } from './versionCheck';
 import type { Worker } from './worker';
 
-export const runningWorkers = new Set<BirpcReturn<Worker, TestRunReporter>>();
+type WorkerRpc = BirpcReturn<Worker, TestRunReporter>;
+
+export const runningWorkers = new Set<WorkerRpc>();
+export const WATCHER_CLOSE_TIMEOUT_MS = 30_000;
+const forceKilledWorkers = new WeakSet<WorkerRpc>();
+const workerClosePromises = new WeakMap<WorkerRpc, Promise<void>>();
+
+export const closeWorkerGracefully = (worker: WorkerRpc): Promise<void> => {
+  if (worker.$closed) {
+    return Promise.resolve();
+  }
+  const pendingClose = workerClosePromises.get(worker);
+  if (pendingClose) {
+    return pendingClose;
+  }
+
+  const closePromise = (async () => {
+    let timer: NodeJS.Timeout | undefined;
+    let closeTimedOut = false;
+    try {
+      await Promise.race([
+        Promise.resolve()
+          .then(() => worker.closeWatcher())
+          .catch((error) => {
+            logger.warn('Failed to close the continuous test watcher', error);
+          }),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            closeTimedOut = true;
+            resolve();
+          }, WATCHER_CLOSE_TIMEOUT_MS);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (closeTimedOut) {
+        forceKilledWorkers.add(worker);
+        logger.warn(
+          'Timed out waiting for the continuous test watcher to close; terminating the worker. Watcher teardown was skipped.',
+        );
+      }
+      if (!worker.$closed) {
+        worker.$close();
+      }
+    }
+  })();
+  workerClosePromises.set(worker, closePromise);
+  return closePromise;
+};
 
 // Default host for a fixed debug port. The spawn (`--inspect-wait`), the port
 // preflight, and the attach config must all use the same host: on a dual-stack
@@ -48,8 +100,10 @@ const isPortAvailable = (port: number, host?: string): Promise<boolean> =>
   });
 
 export class RstestApi {
-  private childProcesses = new Set<ChildProcess>();
-  private coreVersionTooLowWarned = false;
+  private workers = new Set<WorkerRpc>();
+  private configuredCoreVersionWarned = false;
+  private disposed = false;
+  private disposePromise?: Promise<void>;
 
   constructor(
     private workspace: vscode.WorkspaceFolder,
@@ -57,6 +111,12 @@ export class RstestApi {
     private configFilePath: string,
     private project: Project,
   ) {}
+
+  private assertNotDisposed(): void {
+    if (this.disposed) {
+      throw new Error('Rstest API is disposed.');
+    }
+  }
 
   private expandWorkspaceFolder(value: string): string {
     return value.replaceAll('${workspaceFolder}', this.workspace.uri.fsPath);
@@ -184,11 +244,20 @@ export class RstestApi {
         });
       }
 
-      if (shouldWarnCoreVersion(coreVersion) && !this.coreVersionTooLowWarned) {
-        this.coreVersionTooLowWarned = true;
-        vscode.window.showWarningMessage(
-          formatCoreVersionWarningMessage(coreVersion),
-        );
+      if (isUnsupportedCoreVersion(coreVersion)) {
+        if (configured) {
+          // An explicit package path is a developer override. Feature branches
+          // keep the previous release version until their release PR, so local
+          // extension development must be able to target the checkout's core.
+          if (!this.configuredCoreVersionWarned) {
+            this.configuredCoreVersionWarned = true;
+            vscode.window.showWarningMessage(
+              formatConfiguredCoreVersionWarningMessage(coreVersion),
+            );
+          }
+        } else {
+          throw new Error(formatUnsupportedCoreVersionMessage(coreVersion));
+        }
       }
 
       return nodeExport;
@@ -220,24 +289,28 @@ export class RstestApi {
 
   public async getNormalizedConfig() {
     const worker = await this.createChildProcess();
-    const config = await worker.getNormalizedConfig({
-      rstestPath: this.resolveRstestPath(),
-      configFilePath: this.configFilePath,
-    });
-    worker.$close();
-    return config;
+    try {
+      return await worker.getNormalizedConfig({
+        rstestPath: this.resolveRstestPath(),
+        configFilePath: this.configFilePath,
+      });
+    } finally {
+      worker.$close();
+    }
   }
 
   public async listTests(include?: string[]) {
     const worker = await this.createChildProcess();
-    const tests = await worker.listTests({
-      rstestPath: this.resolveRstestPath(),
-      configFilePath: this.configFilePath,
-      include,
-      includeTaskLocation: true,
-    });
-    worker.$close();
-    return tests;
+    try {
+      return await worker.listTests({
+        rstestPath: this.resolveRstestPath(),
+        configFilePath: this.configFilePath,
+        include,
+        includeTaskLocation: true,
+      });
+    } finally {
+      worker.$close();
+    }
   }
 
   public async runTest({
@@ -285,7 +358,10 @@ export class RstestApi {
       this.project,
       testCaseNamePath,
       coverageEnabled,
-      onFinish,
+      // The worker RPC settles after post-report checks for one-shot runs and
+      // after the initial watch session is established for continuous runs. It
+      // also settles on startup failures that emit no reporter end event.
+      undefined,
       createTestRun,
       this.configFilePath,
       applyDiagnostic ? diagnostics : undefined,
@@ -298,12 +374,12 @@ export class RstestApi {
       run,
     );
     token.onCancellationRequested(() => {
-      worker.$close();
-      onFinish();
+      void closeWorkerGracefully(worker).finally(onFinish);
     });
 
-    void worker
-      .runTest({
+    let workerRun: Promise<void>;
+    try {
+      workerRun = worker.runTest({
         command: continuous ? 'watch' : 'run',
         fileFilters: fileFilter ? [fileFilter] : undefined,
         testNamePattern: testCaseNamePath
@@ -314,7 +390,14 @@ export class RstestApi {
         rstestPath: this.resolveRstestPath(),
         coverage: coverageEnabled ? { enabled: true } : undefined,
         includeTaskLocation: true,
-      })
+      });
+    } catch (error) {
+      worker.$close();
+      throw error;
+    }
+
+    void workerRun
+      .then(onFinish)
       .catch((error) => {
         if (!token.isCancellationRequested) {
           const message = toErrorMessage(error);
@@ -402,21 +485,25 @@ export class RstestApi {
     startDebugging?: boolean,
     testRun?: vscode.TestRun,
   ) {
+    this.assertNotDisposed();
     const rstestPath = this.resolveRstestPath();
     if (!rstestPath) {
       throw new Error('Failed to resolve rstest path');
     }
     const debuggerPort = getConfigValue('debuggerPort', this.workspace);
     const debuggerAddress = getConfigValue('debuggerAddress', this.workspace);
-    if (
-      startDebugging &&
-      debuggerPort &&
-      !(await isPortAvailable(debuggerPort, debuggerAddress))
-    ) {
-      const at = `${debuggerAddress ?? DEFAULT_DEBUG_HOST}:${debuggerPort}`;
-      const message = `Rstest debug port ${at} is already in use. Set a free "rstest.debuggerPort" or free the port.`;
-      vscode.window.showErrorMessage(message);
-      throw new Error(message);
+    if (startDebugging && debuggerPort) {
+      const portAvailable = await isPortAvailable(
+        debuggerPort,
+        debuggerAddress,
+      );
+      this.assertNotDisposed();
+      if (!portAvailable) {
+        const at = `${debuggerAddress ?? DEFAULT_DEBUG_HOST}:${debuggerPort}`;
+        const message = `Rstest debug port ${at} is already in use. Set a free "rstest.debuggerPort" or free the port.`;
+        vscode.window.showErrorMessage(message);
+        throw new Error(message);
+      }
     }
     const execArgv: string[] = [];
     if (startDebugging) {
@@ -457,7 +544,6 @@ export class RstestApi {
         },
       },
     );
-    this.childProcesses.add(rstestProcess);
 
     rstestProcess.stdout?.on('data', (d) => {
       const content = d.toString();
@@ -479,12 +565,15 @@ export class RstestApi {
       bind: 'functions',
       timeout: 600_000,
       off: () => {
-        rstestProcess.kill();
-        this.childProcesses.delete(rstestProcess);
+        rstestProcess.kill(
+          forceKilledWorkers.has(worker) ? 'SIGKILL' : 'SIGTERM',
+        );
+        this.workers.delete(worker);
         runningWorkers.delete(worker);
       },
     });
 
+    this.workers.add(worker);
     runningWorkers.add(worker);
 
     logger.debug('Sent init payload to worker', {
@@ -514,38 +603,49 @@ export class RstestApi {
     // handled instead of throwing uncaught in the extension host.
     if (startDebugging) {
       const debugOutFiles = getConfigValue('debugOutFiles', this.workspace);
-      const startedDebugging = await vscode.debug.startDebugging(
-        this.workspace,
-        {
-          type: 'node',
-          name: 'Rstest Debug',
-          request: 'attach',
-          skipFiles: getConfigValue('debugExclude', this.workspace),
-          ...(debugOutFiles.length ? { outFiles: debugOutFiles } : {}),
-          ...(debuggerPort
-            ? {
-                port: debuggerPort,
-                address: debuggerAddress ?? DEFAULT_DEBUG_HOST,
-              }
-            : { processId: rstestProcess.pid }),
-        },
-        { testRun },
-      );
-      if (!startedDebugging) {
-        rstestProcess.kill();
-        throw new Error(
-          `Failed to attach debugger to test worker process (PID: ${rstestProcess.pid})`,
+      try {
+        const startedDebugging = await vscode.debug.startDebugging(
+          this.workspace,
+          {
+            type: 'node',
+            name: 'Rstest Debug',
+            request: 'attach',
+            skipFiles: getConfigValue('debugExclude', this.workspace),
+            ...(debugOutFiles.length ? { outFiles: debugOutFiles } : {}),
+            ...(debuggerPort
+              ? {
+                  port: debuggerPort,
+                  address: debuggerAddress ?? DEFAULT_DEBUG_HOST,
+                }
+              : { processId: rstestProcess.pid }),
+          },
+          { testRun },
         );
+        this.assertNotDisposed();
+        if (!startedDebugging) {
+          throw new Error(
+            `Failed to attach debugger to test worker process (PID: ${rstestProcess.pid})`,
+          );
+        }
+      } catch (error) {
+        if (!worker.$closed) {
+          worker.$close();
+        }
+        throw error;
       }
     }
 
     return worker;
   }
 
-  public dispose() {
-    for (const child of this.childProcesses) {
-      child.kill();
-    }
-    this.childProcesses.clear();
+  public dispose(): Promise<void> {
+    // VS Code does not always await project disposal during refresh or host
+    // shutdown. Starting every close eagerly still gives teardown its best
+    // chance, while explicit callers and deactivate() can await the same work.
+    this.disposed = true;
+    this.disposePromise ??= Promise.all(
+      Array.from(this.workers, closeWorkerGracefully),
+    ).then(() => undefined);
+    return this.disposePromise;
   }
 }

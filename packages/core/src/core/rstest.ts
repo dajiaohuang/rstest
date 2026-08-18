@@ -35,6 +35,7 @@ import {
   resolveBuildCacheDependencyPaths,
   TS_CONFIG_FILE,
 } from '../utils';
+import { createExitCode, type RstestExitCode } from './exitCode';
 import { TestStateManager } from './stateManager';
 
 /**
@@ -46,8 +47,8 @@ function formatEnvironmentName(name: string): string {
 
 /**
  * Report a fatal configuration error. In embedded (programmatic) mode the
- * caller owns the process, so throw and let `runRstest` surface it; otherwise
- * log and exit the CLI process.
+ * caller owns the process, so throw and let the instance API surface it;
+ * otherwise log and exit the CLI process.
  */
 function failConfig(embedded: boolean, message: string): never {
   if (embedded) {
@@ -79,6 +80,7 @@ type Options = {
   trace?: boolean;
   /** See the `embedded` option on `createRstest`. */
   embedded?: boolean;
+  initializeReporters?: boolean;
 };
 
 export class Rstest implements RstestContext {
@@ -94,6 +96,12 @@ export class Rstest implements RstestContext {
   public relatedRerunFiles?: string[];
   public configFilePath?: string;
   public embedded: boolean;
+  public exitCode: RstestExitCode = createExitCode();
+  public workerEnv: Record<string, string | undefined> = {};
+  public globalTeardownCallbacks: Array<
+    () => boolean | void | Promise<boolean | void>
+  > = [];
+  public closeWatchSession?: () => Promise<void>;
   public reporters: Reporter[];
   public snapshotManager: SnapshotManager;
   public trace: boolean;
@@ -135,6 +143,7 @@ export class Rstest implements RstestContext {
       projects,
       trace = false,
       embedded = false,
+      initializeReporters = true,
     }: Options,
     userConfig: RstestConfig,
   ) {
@@ -255,7 +264,7 @@ export class Rstest implements RstestContext {
     );
 
     const reporters =
-      command !== 'list'
+      initializeReporters && command !== 'list'
         ? createReporters(rstestConfig.reporters, {
             rootPath,
             config: rstestConfig,
@@ -288,6 +297,11 @@ export class Rstest implements RstestContext {
     }
 
     this.reporters = reporters;
+  }
+
+  public resetReporterResultState(): void {
+    this.reporterResults = { results: [], testResults: [] };
+    this.reporterResultIndex.clear();
   }
 
   public updateReporterResultState(

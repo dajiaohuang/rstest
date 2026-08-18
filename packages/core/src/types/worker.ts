@@ -139,6 +139,8 @@ export type RunWorkerOptions = {
     entryInfo: EntryInfo;
     setupEntries: EntryInfo[];
     context: WorkerContext;
+    /** Env deletions use a separate JSON-safe wire field because JSON drops `undefined`. */
+    deletedEnvKeys: string[];
     /**
      * Identity of this task's test environment, derived host-side by
      * `getEnvironmentKey`. The pool reuses a worker only for matching keys

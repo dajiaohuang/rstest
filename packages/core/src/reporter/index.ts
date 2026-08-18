@@ -138,6 +138,11 @@ export class DefaultReporter implements Reporter {
     this.nonTTYProgressNotifier?.stop();
   }
 
+  dispose(): void {
+    this.statusRenderer?.stop();
+    this.nonTTYProgressNotifier?.stop();
+  }
+
   async onTestRunEnd({
     results,
     testResults,
